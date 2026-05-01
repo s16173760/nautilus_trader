@@ -4470,9 +4470,9 @@ dependencies = [
 
 [[package]]
 name = "ibapi"
-version = "2.11.2"
+version = "2.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c568adc346c37434969bf59ffedc572caa03e0cab27f526fe326a00d5fca0d4f"
+checksum = "55f738f43115cd39068ee7480f92808cb8bc9ad72252f448fa448cbd199b69a7"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -5986,7 +5986,9 @@ dependencies = [
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
+ "nautilus-system",
  "nautilus-testkit",
+ "nautilus-trading",
  "pyo3",
  "pyo3-async-runtimes",
  "rstest",
