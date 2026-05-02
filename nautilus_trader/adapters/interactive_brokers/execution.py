@@ -1793,10 +1793,11 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         # IB's execDetails callback can race ahead of openOrder for fast fills (typically
         # market orders or marketable limit orders on liquid combos). The Execution object
         # is authoritative for venue_order_id, so backfill the mapping into the cache by
-        # synthesizing an OrderAccepted event when openOrder hasn't fired yet. Without
-        # this, downstream FillReports during continuous reconciliation cannot map
-        # venue_order_id back to client_order_id and are silently dropped.
-        if nautilus_order.venue_order_id is None:
+        # synthesizing an OrderAccepted event for a submitted order when openOrder hasn't
+        # fired yet. Without this, downstream FillReports during continuous reconciliation
+        # cannot map venue_order_id back to client_order_id and are silently dropped. If
+        # openOrder arrives later, _handle_order_event skips the duplicate acceptance.
+        if nautilus_order.venue_order_id is None and nautilus_order.status == OrderStatus.SUBMITTED:
             self._log.warning(
                 f"execDetails arrived before openOrder for {nautilus_order.client_order_id}; "
                 f"synthesizing OrderAccepted with venue_order_id={venue_order_id}",

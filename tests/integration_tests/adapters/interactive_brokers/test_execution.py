@@ -25,6 +25,7 @@ from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
 from nautilus_trader.adapters.interactive_brokers.factories import (
     InteractiveBrokersLiveExecClientFactory,
 )
+from nautilus_trader.adapters.interactive_brokers.parsing.execution import timestring_to_timestamp
 from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import OptionKind
@@ -1287,13 +1288,68 @@ async def test_spread_execution_handles_exec_details_before_open_order(mocker, e
     # venue_order_id mapping.
     assert generate_order_accepted.call_count == 1
     assert generate_order_accepted.call_args.kwargs["venue_order_id"] == venue_order_id
+    assert (
+        generate_order_accepted.call_args.kwargs["ts_event"]
+        == timestring_to_timestamp(execution.time).value
+    )
 
     # The leg fill must be generated with venue_order_id derived from the
     # execution rather than crashing.
-    assert generate_order_filled.call_count >= 1
+    assert generate_order_filled.call_count == 1
     leg_fill_call = generate_order_filled.call_args_list[0].kwargs
     assert leg_fill_call["instrument_id"] == call.id
     assert leg_fill_call["venue_order_id"] == VenueOrderId(f"{venue_order_id.value}-LEG-0")
+
+
+@pytest.mark.asyncio
+async def test_exec_details_does_not_accept_rejected_order(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    client_order_id = ClientOrderId("O-REJECTED-RACE-001")
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=client_order_id,
+    )
+    order = TestExecStubs.make_submitted_order(order)
+    cache.add_order(order, None)
+
+    exec_client._handle_order_event(
+        status=OrderStatus.REJECTED,
+        order=order,
+        reason="Rejected before late execDetails",
+    )
+    assert cache.order(client_order_id).status == OrderStatus.REJECTED
+    assert cache.order(client_order_id).venue_order_id is None
+
+    venue_order_id = VenueOrderId("7201")
+    generate_order_accepted = mocker.spy(exec_client, "generate_order_accepted")
+    mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = str(client_order_id)
+    commission_report = IBTestExecStubs.commission()
+    commission_report.execId = execution.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution,
+        commission_report=commission_report,
+        contract=contract_details.contract,
+    )
+
+    assert generate_order_accepted.call_count == 0
+    assert cache.order(client_order_id).status == OrderStatus.REJECTED
 
 
 @pytest.mark.asyncio
@@ -1336,6 +1392,15 @@ async def test_on_order_status_cancel_propagates_venue_order_id_when_order_unacc
 
     assert generate_order_canceled.call_count == 1
     assert generate_order_canceled.call_args.kwargs["venue_order_id"] == venue_order_id
+    assert cache.order(client_order_id).status == OrderStatus.CANCELED
+
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Cancelled",
+        venue_order_id=venue_order_id,
+    )
+
+    assert generate_order_canceled.call_count == 1
 
 
 @pytest.mark.asyncio
