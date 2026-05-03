@@ -163,6 +163,13 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         # cancel-replace when CANCELED(old_voi) arrives before the replacement
         # ACCEPTED(new_voi). See GH-3827.
         self._pending_modify_keys: dict[str, str] = {}
+        # client_order_id.value to FillReports buffered while a cancel-replace
+        # modify is in flight, populated when a fill arrives carrying the
+        # replacement's new venue_order_id before the matching ACCEPTED has
+        # advanced the local order state. Drained from the cancel-replace
+        # ACCEPTED branch so OrderFilled is only emitted against an order
+        # whose venue_order_id and quantity match the fill. See GH-3972.
+        self._buffered_fills: dict[str, list[nautilus_pyo3.FillReport]] = {}
 
         self._fee_refresh_task: asyncio.Task | None = None
 
@@ -258,6 +265,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.info(f"Cached cloid mappings for {count} existing order(s)", LogColor.BLUE)
 
     def _cleanup_cloid_mapping(self, client_order_id: ClientOrderId) -> None:
+        # Drop any cancel-replace fill buffer for this order so a terminal
+        # transition cannot strand fills on an order that no longer exists in
+        # the local cache. See GH-3972.
+        self._buffered_fills.pop(client_order_id.value, None)
         try:
             pyo3_client_order_id = nautilus_pyo3.ClientOrderId(client_order_id.value)
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
@@ -1185,6 +1196,17 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     ts_event=report.ts_last,
                     venue_order_id_modified=True,
                 )
+
+                # Drain any FillReports that arrived during the cancel-replace
+                # window so they emit against the now-advanced local state. The
+                # pending marker has been cleared and the cached venue_order_id
+                # has been updated, so the buffer guard in
+                # `_handle_fill_report_pyo3` will pass on the re-dispatch. See
+                # GH-3972.
+                buffered = self._buffered_fills.pop(key, None)
+                if buffered:
+                    for pyo3_buffered in buffered:
+                        self._handle_fill_report_pyo3(pyo3_buffered)
                 return
 
             if key in self._accepted_orders or key in self._terminal_orders:
@@ -1361,9 +1383,37 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             )
             return
 
-        self._processed_trade_ids.add(trade_id_str)
-
         key = order.client_order_id.value
+
+        # Cancel-replace fill-leg race: a fill whose venue_order_id does not
+        # match the order's cached venue_order_id while a modify is in flight
+        # belongs to the replacement order whose ACCEPTED has not yet been
+        # promoted to OrderUpdated. Buffer the fill and bail out without
+        # marking the trade as processed; the cancel-replace ACCEPTED branch
+        # in `_handle_order_status_report_pyo3` drains the buffer and
+        # re-dispatches once the local order state has been advanced. The
+        # `_pending_modify_keys` requirement is critical: a stale old-leg fill
+        # arriving after the cancel-replace has already promoted (no marker,
+        # just a VOI mismatch the other way) must fall through to normal
+        # emission so the engine can reject on venue_order_id mismatch and
+        # reconciliation can recover, rather than being stranded indefinitely
+        # in the buffer. See GH-3972.
+        cached_voi = self._cache.venue_order_id(order.client_order_id)
+        if (
+            key in self._pending_modify_keys
+            and cached_voi is not None
+            and report.venue_order_id is not None
+            and report.venue_order_id != cached_voi
+        ):
+            self._log.debug(
+                f"Buffering cancel-replace fill for {order.client_order_id!r}: "
+                f"report_voi={report.venue_order_id!r}, cached_voi={cached_voi!r}, "
+                f"trade_id={report.trade_id!r}",
+            )
+            self._buffered_fills.setdefault(key, []).append(pyo3_report)
+            return
+
+        self._processed_trade_ids.add(trade_id_str)
 
         # If order not yet accepted, generate OrderAccepted first to avoid state transition error
         if key not in self._accepted_orders:

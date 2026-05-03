@@ -16,7 +16,7 @@
 use std::{
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
@@ -25,8 +25,8 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use nautilus_common::live::get_runtime;
-use nautilus_core::AtomicMap;
+use nautilus_common::{cache::fifo::FifoCacheMap, live::get_runtime};
+use nautilus_core::{AtomicMap, MUTEX_POISONED};
 use nautilus_model::{
     data::BarType,
     identifiers::{AccountId, ClientOrderId, InstrumentId},
@@ -55,6 +55,20 @@ use crate::{
 };
 
 const HYPERLIQUID_HEARTBEAT_MSG: &str = r#"{"method":"ping"}"#;
+
+/// Bound on the cloid -> client_order_id resolution cache.
+///
+/// FIFO eviction matches the rest of the adapter's cleanup-on-overflow model
+/// (see `FifoCache` uses in `WsDispatchState` and `FeedHandler`) so the cache
+/// self-evicts even when `remove_cloid_mapping` is bypassed (for example, the
+/// drain path in `dispatch::handle_accepted` for a buffered cancel-replace
+/// fill, see GH-3972).
+pub(super) const CLOID_CACHE_CAPACITY: usize = 10_000;
+
+/// Shared cloid -> client_order_id cache backing
+/// [`HyperliquidWebSocketClient::cache_cloid_mapping`] and the WS handler
+/// resolution path.
+pub(super) type CloidCache = Arc<Mutex<FifoCacheMap<Ustr, ClientOrderId, CLOID_CACHE_CAPACITY>>>;
 
 /// Represents the different data types available from asset context subscriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,7 +105,7 @@ pub struct HyperliquidWebSocketClient {
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     bar_types: Arc<AtomicMap<String, BarType>>,
     asset_context_subs: Arc<DashMap<Ustr, AHashSet<AssetContextDataType>>>,
-    cloid_cache: Arc<DashMap<Ustr, ClientOrderId>>,
+    cloid_cache: CloidCache,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     account_id: Option<AccountId>,
     transport_backend: TransportBackend,
@@ -148,7 +162,7 @@ impl HyperliquidWebSocketClient {
             instruments: Arc::new(AtomicMap::new()),
             bar_types: Arc::new(AtomicMap::new()),
             asset_context_subs: Arc::new(DashMap::new()),
-            cloid_cache: Arc::new(DashMap::new()),
+            cloid_cache: Arc::new(Mutex::new(FifoCacheMap::new())),
             cmd_tx: {
                 // Placeholder channel until connect() creates the real handler and replays queued instruments
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -416,17 +430,35 @@ impl HyperliquidWebSocketClient {
     ///
     /// This writes directly to a shared cache that the handler reads from, avoiding any
     /// race conditions between caching and WebSocket message processing.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "cloid cache mutex poisoning is not expected"
+    )]
     pub fn cache_cloid_mapping(&self, cloid: Ustr, client_order_id: ClientOrderId) {
         log::debug!("Caching cloid mapping: {cloid} -> {client_order_id}");
-        self.cloid_cache.insert(cloid, client_order_id);
+        self.cloid_cache
+            .lock()
+            .expect(MUTEX_POISONED)
+            .insert(cloid, client_order_id);
     }
 
     /// Removes a cloid mapping from the cache.
     ///
-    /// Should be called when an order reaches a terminal state (filled, canceled, expired)
-    /// to prevent unbounded memory growth in long-running sessions.
+    /// Should be called when an order reaches a terminal state (filled, canceled, expired).
+    /// The cache is FIFO-bounded so missed removals self-evict on overflow rather than
+    /// leaking forever (relevant to the cancel-replace drain path; see GH-3972).
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "cloid cache mutex poisoning is not expected"
+    )]
     pub fn remove_cloid_mapping(&self, cloid: &Ustr) {
-        if self.cloid_cache.remove(cloid).is_some() {
+        if self
+            .cloid_cache
+            .lock()
+            .expect(MUTEX_POISONED)
+            .remove(cloid)
+            .is_some()
+        {
             log::debug!("Removed cloid mapping: {cloid}");
         }
     }
@@ -434,9 +466,14 @@ impl HyperliquidWebSocketClient {
     /// Clears all cloid mappings from the cache.
     ///
     /// Useful for cleanup during reconnection or shutdown.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "cloid cache mutex poisoning is not expected"
+    )]
     pub fn clear_cloid_cache(&self) {
-        let count = self.cloid_cache.len();
-        self.cloid_cache.clear();
+        let mut cache = self.cloid_cache.lock().expect(MUTEX_POISONED);
+        let count = cache.len();
+        cache.clear();
 
         if count > 0 {
             log::debug!("Cleared {count} cloid mappings from cache");
@@ -445,16 +482,28 @@ impl HyperliquidWebSocketClient {
 
     /// Returns the number of cloid mappings in the cache.
     #[must_use]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "cloid cache mutex poisoning is not expected"
+    )]
     pub fn cloid_cache_len(&self) -> usize {
-        self.cloid_cache.len()
+        self.cloid_cache.lock().expect(MUTEX_POISONED).len()
     }
 
     /// Looks up a client_order_id by its cloid hash.
     ///
     /// Returns `Some(ClientOrderId)` if the mapping exists, `None` otherwise.
     #[must_use]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "cloid cache mutex poisoning is not expected"
+    )]
     pub fn get_cloid_mapping(&self, cloid: &Ustr) -> Option<ClientOrderId> {
-        self.cloid_cache.get(cloid).map(|entry| *entry.value())
+        self.cloid_cache
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(cloid)
+            .copied()
     }
 
     /// Gets an instrument from the cache by ID.

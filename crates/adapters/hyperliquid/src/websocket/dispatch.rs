@@ -46,6 +46,27 @@
 //! early `CANCELED(old_voi)` that arrives before the replacement
 //! `ACCEPTED(new_voi)` on the WebSocket, regardless of whether the WS
 //! message races ahead of the HTTP response.
+//!
+//! # GH-3972 fill-leg cancel-replace race
+//!
+//! The mirror race for fills: a [`FillReport`] for the replacement order can
+//! arrive on the WebSocket before the replacement `ACCEPTED(new_voi)` has
+//! been promoted to `OrderUpdated`. Emitting `OrderFilled` immediately would
+//! drive the engine to reject the fill (`venue_order_id` mismatch, or overfill
+//! when the modify changed quantity).
+//!
+//! [`dispatch_fill_report`] detects the race when an in-flight modify's
+//! `pending_modify_keys` marker is set and the report's venue order id does
+//! not match the cached value. The fill is buffered in
+//! [`WsDispatchState::buffered_fills`] and re-dispatched from the
+//! cancel-replace branch of `handle_accepted` after the cached VOI has been
+//! advanced; the second dispatch passes the buffer guard (cached VOI now
+//! equals the report's VOI) and emits `OrderFilled` against up-to-date
+//! local state. The marker requirement is intentional: a stale old-leg fill
+//! arriving after a cancel-replace has already promoted (no marker, just a
+//! VOI mismatch the other way) must fall through to normal emission so the
+//! engine can reject on venue_order_id mismatch and reconciliation can
+//! recover, rather than being stranded indefinitely in the buffer.
 
 use std::{
     collections::VecDeque,
@@ -206,6 +227,18 @@ pub struct WsDispatchState {
     /// race and suppressed so the later `ACCEPTED(new_voi)` can flow through
     /// the `OrderUpdated` path.
     pub pending_modify_keys: DashMap<ClientOrderId, VenueOrderId>,
+    /// `FillReport`s buffered while a cancel-replace modify is in flight.
+    ///
+    /// Populated by `dispatch_fill_report` when `pending_modify_keys` is set
+    /// (an in-flight modify) AND the report carries a `venue_order_id` that
+    /// does not match the cached value. Drained by the cancel-replace branch
+    /// of `handle_accepted` after the cached VOI has been advanced, so the
+    /// engine never observes a fill against stale local order state. The
+    /// marker requirement is critical: without it, a stale old-leg fill
+    /// arriving after the cancel-replace promotion would also see a VOI
+    /// mismatch and be buffered indefinitely (no further ACCEPTED would
+    /// drain it). See GH-3972.
+    pub buffered_fills: DashMap<ClientOrderId, Vec<FillReport>>,
     /// Cumulative filled quantity per tracked order. Compared against
     /// `OrderIdentity::quantity` to decide when to clean up tracked state.
     pub order_filled_qty: DashMap<ClientOrderId, Quantity>,
@@ -221,6 +254,7 @@ impl Default for WsDispatchState {
             emitted_trades: Mutex::new(BoundedDedup::new(DEDUP_CAPACITY)),
             cached_venue_order_ids: DashMap::new(),
             pending_modify_keys: DashMap::new(),
+            buffered_fills: DashMap::new(),
             order_filled_qty: DashMap::new(),
             clearing: AtomicBool::new(false),
         }
@@ -327,6 +361,35 @@ impl WsDispatchState {
         self.pending_modify_keys.get(client_order_id).map(|r| *r)
     }
 
+    /// Buffers a `FillReport` that arrived during an in-flight cancel-replace
+    /// modify. Drained by the cancel-replace branch of `handle_accepted` once
+    /// the cached venue order id has been advanced. See GH-3972.
+    pub fn buffer_fill(&self, client_order_id: ClientOrderId, fill: FillReport) {
+        self.buffered_fills
+            .entry(client_order_id)
+            .or_default()
+            .push(fill);
+    }
+
+    /// Removes and returns any buffered `FillReport`s for the given client
+    /// order id, in arrival order.
+    #[must_use]
+    pub fn drain_buffered_fills(&self, client_order_id: &ClientOrderId) -> Vec<FillReport> {
+        self.buffered_fills
+            .remove(client_order_id)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of currently buffered `FillReport`s for the given
+    /// client order id.
+    #[must_use]
+    pub fn buffered_fill_count(&self, client_order_id: &ClientOrderId) -> usize {
+        self.buffered_fills
+            .get(client_order_id)
+            .map_or(0, |r| r.len())
+    }
+
     /// Records cumulative filled quantity for a tracked order.
     pub fn record_filled_qty(&self, client_order_id: ClientOrderId, qty: Quantity) {
         self.order_filled_qty.insert(client_order_id, qty);
@@ -347,6 +410,7 @@ impl WsDispatchState {
         self.emitted_accepted.remove(client_order_id);
         self.cached_venue_order_ids.remove(client_order_id);
         self.pending_modify_keys.remove(client_order_id);
+        self.buffered_fills.remove(client_order_id);
         self.order_filled_qty.remove(client_order_id);
     }
 
@@ -475,6 +539,44 @@ pub fn dispatch_fill_report(
         return DispatchOutcome::External;
     };
 
+    // Cancel-replace fill-leg race: a fill whose venue_order_id does not
+    // match the cached value while a modify is in flight belongs to the
+    // replacement order whose ACCEPTED has not yet promoted local state.
+    // Buffer it; the cancel-replace branch of `handle_accepted` drains the
+    // buffer and re-dispatches once the cached VOI advances. The re-dispatch
+    // passes this guard (the pending marker is cleared on the ACCEPTED) and
+    // emits `OrderFilled` against up-to-date state. Trade dedup is checked
+    // AFTER the buffer guard so the re-dispatch is not suppressed by the
+    // dedup set. The pending-marker requirement is critical: a stale
+    // old-leg fill arriving after the cancel-replace promotion has advanced
+    // `cached_venue_order_ids` (no marker, just a VOI mismatch in the other
+    // direction) must NOT be buffered: buffering it would strand the fill
+    // forever since no further ACCEPTED on this cid will drain it. Without
+    // the marker the fill falls through and emits `OrderFilled` with the
+    // old VOI; the engine rejects on venue_order_id mismatch and
+    // reconciliation recovers from there.
+    //
+    // Known limitation: a delayed earlier-leg fill (e.g. for VOI `A` from a
+    // prior `A -> B` promotion) arriving while a *new* modify `B -> C` is
+    // in flight will be buffered here (marker set, `A != cached(B)`) and
+    // stranded if `B -> C` then fails: `clear_pending_modify` removes the
+    // marker but no future ACCEPTED on this cid arrives to drain the entry.
+    // Terminal cleanup eventually drops it; the fill is recoverable via
+    // reconciliation (mass status / fill_reports query). See GH-3972.
+    if state.pending_modify(&client_order_id).is_some()
+        && let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
+        && report.venue_order_id != cached_voi
+    {
+        log::debug!(
+            "Buffering cancel-replace fill for {client_order_id}: \
+             report_voi={}, cached_voi={cached_voi}, trade_id={}",
+            report.venue_order_id,
+            report.trade_id,
+        );
+        state.buffer_fill(client_order_id, report.clone());
+        return DispatchOutcome::Tracked;
+    }
+
     if state.check_and_insert_trade(report.trade_id) {
         log::debug!(
             "Skipping duplicate fill for {client_order_id}: trade_id={}",
@@ -582,6 +684,27 @@ fn handle_accepted(
             false,
         );
         emitter.send_order_event(OrderEventAny::Updated(updated));
+
+        // Drain any FillReports that arrived during the cancel-replace
+        // window so they emit against the now-advanced local state instead
+        // of the stale leg. The pending-modify marker has been cleared above
+        // and the cached VOI has been advanced, so the buffer guard in
+        // `dispatch_fill_report` will pass on the re-dispatch. See GH-3972.
+        //
+        // The drain calls `dispatch_fill_report` directly, bypassing the
+        // `handle_execution_report` wrapper that owns `pending_filled_cloids`
+        // and the WS cloid-mapping cache. If a FILLED status marker arrived
+        // ahead of the buffered fill, the deferred-cleanup entries it
+        // installed are not evicted from those caches when the buffered fill
+        // finally lands. Both caches are FIFO-bounded (`pending_filled_cloids`
+        // and `HyperliquidWebSocketClient::cloid_cache`, both at 10_000
+        // entries), so any residue self-evicts on overflow. A future stale
+        // message for the same cloid is also suppressed via `filled_orders`,
+        // so the residue carries no correctness consequence.
+        let buffered = state.drain_buffered_fills(&client_order_id);
+        for fill in buffered {
+            dispatch_fill_report(&fill, state, emitter, ts_init);
+        }
         return DispatchOutcome::Tracked;
     }
 
